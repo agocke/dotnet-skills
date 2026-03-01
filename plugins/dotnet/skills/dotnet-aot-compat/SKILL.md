@@ -1,6 +1,12 @@
 ---
 name: dotnet-aot-compat
-description: Make a .NET project AOT/trimming compatible. Iteratively finds and fixes IL warnings.
+description: >
+  Make .NET projects compatible with Native AOT and trimming by systematically
+  resolving IL trim/AOT analyzer warnings. USE FOR: making projects AOT-compatible,
+  fixing trimming warnings, resolving IL warnings (IL2026, IL2070, IL2067, IL2072,
+  IL3050), adding DynamicallyAccessedMembers annotations, enabling IsAotCompatible.
+  DO NOT USE FOR: publishing native AOT binaries, optimizing binary size, replacing
+  reflection-heavy libraries with alternatives.
 ---
 
 # dotnet-aot-compat
@@ -10,16 +16,16 @@ Make .NET projects compatible with Native AOT and trimming by systematically res
 ## When to Use This Skill
 
 - **"Make this project AOT-compatible"**
-- **"Fix trimming warnings"**
-- **"Resolve IL warnings"**
+- **"Fix trimming warnings"** or **"fix IL warnings"**
+- **"Resolve IL2070 / IL2067 / IL2072 / IL2026 / IL3050 warnings"**
+- **"Add DynamicallyAccessedMembers annotations"**
+- **"Enable IsAotCompatible in my .csproj"**
+- **"My project has trim analyzer warnings after upgrading to net8.0"**
+- **"Annotate reflection code for the trimmer"**
 
 ## When Not to Use This Skill
 
 Do not use this skill when the project exclusively targets .NET Framework (net4x), which does not support the trim/AOT analyzers.
-
-## Non-Goals
-
-This skill resolves trim/AOT analyzer warnings but does not cover publishing a native AOT binary, optimizing binary size, or replacing reflection-heavy libraries with alternatives.
 
 ## Prerequisites
 
@@ -31,13 +37,13 @@ Native AOT and the IL trimmer perform static analysis to determine what code is 
 
 ## Critical Rules
 
-### Never suppress warnings
-
-Every IL warning represents a real code path that WILL break at runtime under trimming or AOT. There are no "false positives" — if the analyzer warns, the trimmer will fail or produce broken code. Suppressions just move the failure from build time to runtime.
+### ❌ Never suppress warnings incorrectly
 
 - **NEVER** use `#pragma warning disable` for IL warnings. It hides warnings from the Roslyn analyzer at build time, but the IL linker and AOT compiler still see the issue. The code will fail at trim/publish time.
 - **NEVER** use `[UnconditionalSuppressMessage]`. It tells both the analyzer AND the linker to ignore the warning, meaning the trimmer cannot verify safety. Raising an error at build time is always preferable to hiding the issue and having it silently break at runtime.
-- If your first instinct for a warning is to suppress it, **stop and look at the "Fix recipes" section below** — there is almost always a real fix.
+
+### 💡 Preferred approaches
+
 - **Prefer** `[DynamicallyAccessedMembers]` annotations to flow type information through the call chain.
 - **Prefer** refactoring to eliminate patterns that break annotation flow (e.g., boxing `Type` through `object[]`).
 - **Use** `[RequiresUnreferencedCode]` / `[RequiresDynamicCode]` / `[RequiresAssemblyFiles]` to mark methods as fundamentally incompatible with trimming, propagating the requirement to callers. This surfaces the issue clearly rather than hiding it — callers must explicitly acknowledge the incompatibility.
@@ -80,13 +86,27 @@ Sort and deduplicate. Common warning codes:
 - **IL3000**: `Assembly.Location` returns empty string in single-file/AOT apps
 - **IL3050**: Calling a method marked `[RequiresDynamicCode]`
 
-### Step 3: Fix warnings iteratively (innermost first)
+### Step 3: Triage warnings by code (do NOT read every file)
+
+Group the warnings from Step 2 by warning code and count them. **Do not open individual files yet.** Identify the top 1-2 patterns by count — these drive your fix strategy:
+
+| Pattern | Typical fix |
+|---------|-------------|
+| Many IL2026 + IL3050 from `JsonSerializer` | **Go to Strategy C immediately** — create a `JsonSerializerContext`, then batch-update all call sites |
+| IL2070/IL2087 on `Type` parameters | Add `[DynamicallyAccessedMembers]` to the innermost method, then cascade outward |
+| IL2067 passing unannotated `Type` | Annotate the parameter at the source |
+
+**In most real projects, IL2026/IL3050 from JsonSerializer dominate.** Start with Strategy C unless the warning breakdown clearly shows otherwise. After the batch JSON fix, handle remaining warnings with Strategies A–B. Only use Strategy D as a last resort.
+
+### Step 4: Fix warnings iteratively (innermost first)
 
 Work from the **innermost** reflection call outward. Each fix may cascade new warnings to callers.
 
 **Stay warning-driven.** For each warning, open only the file and line the compiler reported, identify the pattern, apply the matching fix recipe below, and move on. Do not scan the codebase for similar patterns or try to understand the full architecture — fix what the compiler tells you, rebuild, and let new warnings guide the next change. Fix a small batch of warnings (5-10), then rebuild immediately to check progress.
 
-**Use sub-agents when available.** If you have the ability to launch sub-agents (e.g., via a `task` tool), use them to fix individual warnings or small batches of warnings in the same file. Keep the main loop focused on building, parsing warnings, and dispatching — delegate the actual file edits and fix reasoning to sub-agents. This prevents context from filling up with file contents and fix logic, which leads to timeouts on large projects. A good sub-agent prompt includes: the exact warning text (code, file, line), the relevant fix recipe from this skill, and an instruction to make the minimal edit.
+**Use sub-agents when available.** If you can launch sub-agents (e.g., via a `task` tool), dispatch **multiple sub-agents in parallel** to edit different files simultaneously. Keep the main loop focused on building, parsing warnings, and dispatching — delegate actual file edits to sub-agents. For batch JSON updates, give each sub-agent 5-10 files to update in one prompt. Example:
+
+> Update these files to use source-generated JSON: `src/Models/Resource.Serialization.cs`, `src/Models/Identity.Serialization.cs`, `src/Models/Plan.Serialization.cs`. In each file, replace `JsonSerializer.Serialize(writer, value)` with `JsonSerializer.Serialize(writer, value, MyProjectJsonContext.Default.TypeName)` and `JsonSerializer.Deserialize<T>(ref reader)` with `JsonSerializer.Deserialize(ref reader, MyProjectJsonContext.Default.TypeName)`. Only edit the JsonSerializer call sites.
 
 #### Strategy A: Add `[DynamicallyAccessedMembers]` (preferred)
 
@@ -106,7 +126,7 @@ void Process([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMe
 }
 ```
 
-When you annotate a parameter, **all callers** must now pass properly annotated types. This cascades outward — follow each caller and annotate or refactor as needed.
+When you annotate a parameter, **all callers** must now pass properly annotated types. This cascades outward — follow each caller and annotate or refactor as needed. **The caller's annotation must include at least the same member types as the callee's.** If the callee requires `PublicConstructors | NonPublicConstructors`, the caller must specify the same or a superset — using only `NonPublicConstructors` will produce IL2091.
 
 #### Strategy B: Refactor to preserve annotation flow
 
@@ -134,7 +154,36 @@ Common patterns that break flow and how to fix them:
 - **Interface indirection**: Add annotation to the interface method's parameter
 - **Property with boxing getter**: Annotate the property's return type
 
-#### Strategy C: `[RequiresUnreferencedCode]` (last resort)
+#### Strategy C: Source-generated JSON serialization (batch fix)
+
+When most warnings are IL2026/IL3050 from `JsonSerializer.Serialize`/`Deserialize`, this is a single mechanical fix applied in bulk:
+
+1. **Collect affected types** — grep for all `JsonSerializer.Serialize` and `JsonSerializer.Deserialize` call sites. Extract the type being serialized (the `<T>` in `Deserialize<T>`, or the runtime type of the object in `Serialize`).
+
+2. **Create one `JsonSerializerContext`** with `[JsonSerializable]` for every type found:
+
+```csharp
+[JsonSerializerContext]
+[JsonSerializable(typeof(ManagedServiceIdentity))]
+[JsonSerializable(typeof(SystemData))]
+// ... one attribute per type
+internal partial class MyProjectJsonContext : JsonSerializerContext { }
+```
+
+3. **Batch-update all call sites** — do not read each file individually. Apply the pattern mechanically:
+   - `JsonSerializer.Serialize(obj)` → `JsonSerializer.Serialize(obj, MyProjectJsonContext.Default.TypeName)`
+   - `JsonSerializer.Deserialize<T>(json)` → `JsonSerializer.Deserialize(json, MyProjectJsonContext.Default.TypeName)`
+
+   Find and update all call sites in one pass:
+   ```bash
+   # Find all files with JsonSerializer calls
+   grep -rl 'JsonSerializer\.\(Serialize\|Deserialize\)' src/ --include='*.cs'
+   ```
+   Then use sequential `edit` calls to apply the same transformation to every matching file. **Do not use `sed` for C# code** — generics like `Deserialize<T>()` have angle brackets and nested parentheses that sed will mangle.
+
+4. **Build once** to verify. Remaining warnings will be non-serialization issues — handle those with Strategies A–B or D.
+
+#### Strategy D: `[RequiresUnreferencedCode]` (last resort)
 
 When a method fundamentally requires arbitrary reflection that cannot be statically described:
 
@@ -148,63 +197,11 @@ public void LoadPlugin(string assemblyName) {
 
 This propagates to callers — they must also be annotated with `[RequiresUnreferencedCode]`. Use sparingly; it marks the entire call chain as trim-incompatible.
 
-### Fix recipes for commonly-mishandled warnings
-
-These warning types are frequently "fixed" via suppression. Here are the actual fixes:
-
-#### IL2050: P/invoke with COM marshalling
-
-**Wrong**: Suppress with `#pragma` or `[UnconditionalSuppressMessage]`.
-
-**Right**: Migrate from `[DllImport]` to `[LibraryImport]` with a source generator. The `LibraryImport` source generator produces AOT-compatible marshalling code at compile time. For COM-typed `out` parameters, use `[MarshalAs(UnmanagedType.Interface)]` or a custom marshaller. See the `dotnet-pinvoke` skill for detailed guidance. If the P/Invoke is Windows-only, conditionally gate it and mark the containing method `[RequiresDynamicCode]` so callers know.
-
-#### IL3000: `Assembly.Location`
-
-**Wrong**: Suppress because "the code already handles empty string".
-
-**Right**: `Assembly.Location` returns empty in AOT/single-file — this is a real behavioral difference. Replace with one of:
-- `AppContext.BaseDirectory` if you need the app's directory
-- `typeof(T).Assembly.GetName().Name` if you need the assembly name for logging
-- `[RequiresAssemblyFiles("Uses Assembly.Location")]` to propagate the requirement to callers
-
-If the location is used purely for diagnostic/logging purposes and the empty string is acceptable, mark the method with `[RequiresAssemblyFiles]`.
-
-#### IL3050: `Enum.GetValues(Type)`
-
-**Wrong**: Suppress the warning.
-
-**Right**: Use `Enum.GetValues<TEnum>()` (available since net5.0). If the method's generic constraint is `where T : struct` and cannot be changed to `where T : struct, Enum`, change the constraint — the `Enum` constraint has been available since C# 7.3.
-
-#### IL2091: Generic argument missing annotation
-
-**Wrong**: Suppress because "we never actually construct T via reflection".
-
-**Right**: Propagate `[DynamicallyAccessedMembers]` to the generic type parameter:
-
-```csharp
-// Before (warns IL2091):
-public static T EnsureInitialized<T>(ref T? target) where T : class
-    => LazyInitializer.EnsureInitialized<T>(ref target!);
-
-// After (clean):
-public static T EnsureInitialized<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicParameterlessConstructor)] T>(
-    ref T? target) where T : class
-    => LazyInitializer.EnsureInitialized<T>(ref target!);
-```
-
-This may require a polyfill of `DynamicallyAccessedMembersAttribute` for older TFMs (see Polyfills section).
-
-#### IL2026: Calling `[RequiresUnreferencedCode]` methods
-
-**Wrong**: Suppress the warning at the call site.
-
-**Right**: Mark your method with `[RequiresUnreferencedCode]` too, propagating the requirement. If your method is an entry point or API boundary, this is the correct signal — it tells consumers that this code path is not trim-safe. For assembly loading (`AssemblyLoadContext.LoadFromAssemblyPath`, `Assembly.Load`, etc.), the entire call chain should propagate `[RequiresUnreferencedCode]` because loading arbitrary assemblies is fundamentally trim-incompatible.
-
-### Step 4: Rebuild and repeat
+### Step 5: Rebuild and repeat
 
 After each small batch of fixes (5-10 warnings), rebuild with `--no-incremental` and check for new warnings. **Do not attempt to fix all warnings before rebuilding** — frequent rebuilds catch mistakes early and reveal cascading warnings. Fixes cascade — annotating an inner method may surface warnings in its callers. Repeat until `0 Warning(s)`.
 
-### Step 5: Validate all TFMs
+### Step 6: Validate all TFMs
 
 Build all target frameworks to ensure:
 - **0 IL warnings** on net8.0+ TFMs
@@ -215,63 +212,46 @@ Build all target frameworks to ensure:
 dotnet build <project.csproj>  # builds all TFMs
 ```
 
+## Stop Signals
+
+- **Do not analyze more than 2-3 representative files per warning pattern.** After identifying the fix for a pattern, apply it to all matching files without reading each one first.
+- **Start fixing after one build.** Do not do a second analysis pass — begin implementing fixes for the most common warning pattern immediately after Step 3 triage.
+- Stop after achieving **0 IL warnings** for net8.0+ TFMs. Don't optimize or refactor already-clean annotations.
+- If a warning requires **architectural refactoring** beyond annotation flow fixes (e.g., replacing an entire serialization layer), document it and stop — don't rewrite large subsystems.
+- Limit to **3 build-fix iterations** per warning. If annotation flow doesn't resolve it after 3 attempts, escalate to `[RequiresUnreferencedCode]`.
+- Don't chase warnings in **third-party dependencies** you can't modify. Note them and move on.
+- If the user asked a scoped question (e.g., "fix warnings in this file"), don't expand to the entire project.
+
 ## Polyfills for Older TFMs
 
-`DynamicallyAccessedMembersAttribute` shipped in .NET 5. For projects targeting netstandard2.0 or net472, you need a polyfill. The trimmer recognizes the attribute by name, so a local copy works:
-
-```csharp
-#if !NET
-namespace System.Diagnostics.CodeAnalysis
-{
-    [AttributeUsage(AttributeTargets.Field | AttributeTargets.ReturnValue |
-                    AttributeTargets.GenericParameter | AttributeTargets.Parameter |
-                    AttributeTargets.Property, Inherited = false)]
-    internal sealed class DynamicallyAccessedMembersAttribute : Attribute
-    {
-        public DynamicallyAccessedMembersAttribute(DynamicallyAccessedMemberTypes memberTypes)
-            => MemberTypes = memberTypes;
-        public DynamicallyAccessedMemberTypes MemberTypes { get; }
-    }
-
-    [Flags]
-    internal enum DynamicallyAccessedMemberTypes
-    {
-        None = 0,
-        PublicParameterlessConstructor = 0x0001,
-        PublicConstructors = 0x0002 | PublicParameterlessConstructor,
-        NonPublicConstructors = 0x0004,
-        PublicMethods = 0x0008,
-        NonPublicMethods = 0x0010,
-        PublicFields = 0x0020,
-        NonPublicFields = 0x0040,
-        PublicNestedTypes = 0x0080,
-        NonPublicNestedTypes = 0x0100,
-        PublicProperties = 0x0200,
-        NonPublicProperties = 0x0400,
-        PublicEvents = 0x0800,
-        NonPublicEvents = 0x1000,
-        Interfaces = 0x2000,
-        All = ~None // Discouraged — prefer specific flags
-    }
-}
-#endif
-```
-
-Similarly for `RequiresUnreferencedCodeAttribute` and `UnconditionalSuppressMessageAttribute` if needed on older TFMs.
+For multi-targeting projects that include netstandard2.0 or net472, you need polyfills for `DynamicallyAccessedMembersAttribute` and related types. See [references/polyfills.md](references/polyfills.md).
 
 ## Common Gotchas
 
-1. **Serialization libraries**: Most reflection-based serializers (e.g., `Newtonsoft.Json`, `XmlSerializer`) are not AOT-compatible. Migrate to a source-generation-based serializer such as `System.Text.Json` with a `JsonSerializerContext`. If migration is not feasible, mark the serialization call site with `[RequiresUnreferencedCode]`.
+1. **External types without AOT-safe serialization**: When a type comes from a dependency you can't modify (e.g., `ResponseError` from `Azure.Core`) and it lacks a source-generated serializer, `Options.GetConverter<T>()` is reflection-based and will produce IL warnings. First check if the type implements `IJsonModel<T>` (common in Azure SDK) — if so, bypass `JsonSerializer` entirely:
 
-2. **Shared projects / projitems**: When source is shared between multiple projects via `<Import>`, annotations added to shared code affect ALL consuming projects. Verify that all consumers still build cleanly.
+```csharp
+// Before (IL2026 — JsonSerializer uses reflection):
+JsonSerializer.Serialize(writer, errorValue);
+
+// After (AOT-safe — uses IJsonModel directly):
+((IJsonModel<ResponseError>)errorValue).Write(writer, ModelReaderWriterOptions.Json);
+
+// For deserialization:
+var error = ((IJsonModel<ResponseError>)new ResponseError()).Create(ref reader, ModelReaderWriterOptions.Json);
+```
+
+Do **not** add the external type to your `JsonSerializerContext` — it won't source-generate for types you don't own. If the type doesn't implement `IJsonModel<T>`, write a custom `JsonConverter<T>` with manual `Utf8JsonReader`/`Utf8JsonWriter` logic and register it via `[JsonSourceGenerationOptions]` on your context.
+
+2. **Serialization libraries**: Most reflection-based serializers (e.g., `Newtonsoft.Json`, `XmlSerializer`) are not AOT-compatible. Migrate to a source-generation-based serializer such as `System.Text.Json` with a `JsonSerializerContext`. If migration is not feasible, mark the serialization call site with `[RequiresUnreferencedCode]`.
+
+3. **Shared projects / projitems**: When source is shared between multiple projects via `<Import>`, annotations added to shared code affect ALL consuming projects. Verify that all consumers still build cleanly.
 
 ## References
 
 [Limitations](https://learn.microsoft.com/en-us/dotnet/core/deploying/native-aot/?tabs=windows%2Cnet8#limitations-of-native-aot-deployment)
-[Conceptual: Understanding
-trimming](https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/trimming-concepts)
-[How-to: trim
-compat](https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/fixing-warnings)
+[Conceptual: Understanding trimming](https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/trimming-concepts)
+[How-to: trim compat](https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/fixing-warnings)
 
 ## Checklist
 
